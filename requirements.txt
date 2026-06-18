@@ -1,0 +1,10 @@
+flask
+flask-cors
+anthropic
+PyPDF2
+python-docx
+openpyxl
+fpdf2
+Pillow
+python-bidi
+gunicorn
