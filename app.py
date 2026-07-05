@@ -26,7 +26,7 @@ app = Flask(__name__, static_folder='static')
 CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB
 
-MODEL = 'claude-sonnet-4-6'
+MODEL = 'claude-sonnet-5'
 
 IMAGE_EXT = {'png', 'jpg', 'jpeg'}
 TEXT_EXT = {'pdf', 'docx', 'xlsx', 'txt'}
@@ -307,7 +307,7 @@ def chat():
     try:
         response = client.messages.create(
             model=MODEL,
-            max_tokens=3000,
+            max_tokens=6000,
             system=system,
             tools=[{'type': 'web_search_20260209', 'name': 'web_search'}],
             messages=messages,

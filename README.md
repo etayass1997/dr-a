@@ -5,7 +5,7 @@ PWA לסטודנטים: פרופיל אישי, העלאת חומרי קורס (P
 ## סטאק
 - **Frontend**: `index.html` — קובץ יחיד (HTML+CSS+JS), RTL מלא, PWA (manifest + service worker)
 - **Backend**: `app.py` — Flask
-- **AI**: Anthropic Claude (`claude-sonnet-4-6`) עם כלי `web_search`
+- **AI**: Anthropic Claude (`claude-sonnet-5`) עם כלי `web_search`
 - **שמירת מצב**: פרופיל הסטודנט, רשימת הקורסים, חומרי הקורס וההיסטוריה נשמרים ב-`localStorage` בדפדפן — אין login ואין בסיס נתונים
 
 ## הרצה מקומית
