@@ -14,6 +14,7 @@
 <link rel="apple-touch-icon" href="/static/icon-192.png">
 <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="/config.js"></script>
+<script>window.DRA_API_KEY = "__DRA_API_KEY__";</script>
 <style>
   :root {
     --navy: #1a237e;
@@ -421,8 +422,45 @@
     justify-content: center;
   }
   .round-btn.attach { background: var(--bg); color: var(--navy); border: 1.5px solid var(--border); }
+  .round-btn.mic { background: var(--bg); color: var(--navy); border: 1.5px solid var(--border); }
+  .round-btn.mic.recording { background: var(--danger); color: var(--white); border-color: var(--danger); }
   .round-btn.send { background: var(--gold); color: var(--navy-dark); }
   .round-btn.send:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .recording-bar {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    background: #fdecea;
+    border: 1px solid #f3c6c0;
+    border-radius: 12px;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    font-size: 0.85rem;
+    color: var(--danger);
+  }
+  .recording-bar.active { display: flex; }
+  .rec-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--danger);
+    animation: rec-blink 1s infinite ease-in-out;
+    flex-shrink: 0;
+  }
+  @keyframes rec-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  #rec-timer { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .recording-bar button {
+    border: none;
+    border-radius: 8px;
+    padding: 5px 10px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  #rec-cancel { background: var(--white); color: var(--danger); border: 1px solid var(--danger); }
+  #rec-stop { background: var(--danger); color: var(--white); }
 
   .toast {
     position: fixed;
@@ -555,9 +593,17 @@
         <span>תמונה מצורפת</span>
         <button class="remove-img" id="btn-remove-image">הסר</button>
       </div>
+      <div class="recording-bar" id="recording-bar">
+        <span class="rec-dot"></span>
+        <span>מקליט...</span>
+        <span id="rec-timer">0:00</span>
+        <button type="button" id="rec-cancel">ביטול</button>
+        <button type="button" id="rec-stop">סיים והמר לטקסט</button>
+      </div>
       <div class="chat-input-row">
         <button class="round-btn attach" id="btn-attach-image" title="צרף תמונה">📷</button>
         <textarea id="chat-input" rows="1" placeholder="שאל אותי כל דבר..."></textarea>
+        <button class="round-btn mic" id="btn-mic" title="הקלטת הודעה קולית">🎤</button>
         <button class="round-btn send" id="btn-send" title="שלח">➤</button>
       </div>
       <input type="file" id="input-chat-image" accept="image/png,image/jpeg" style="display:none">
@@ -569,38 +615,68 @@
 <div class="toast" id="toast"></div>
 
 <script>
-const STORAGE_KEYS = {
-  profile: 'dra_profile',
-  materials: 'dra_materials',
-  history: 'dra_history',
-};
-
 const FILE_ICONS = {
   pdf: '📕', docx: '📘', xlsx: '📗', txt: '📄',
   png: '🖼️', jpg: '🖼️', jpeg: '🖼️',
 };
 
 let pendingImage = null; // {media_type, data, previewUrl} attached to next chat message
+let appState = { profile: null, history: [] }; // mirrors server-side data/state.json
 
-// ── Storage helpers ──────────────────────────────────────────────
-function getProfile() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.profile)); } catch (e) { return null; }
+// ── Server API helpers ─────────────────────────────────────────────
+const API_KEY = window.DRA_API_KEY || '';
+
+function apiUrl(path) {
+  return (window.API_URL || '') + path;
 }
-function saveProfile(profile) {
-  localStorage.setItem(STORAGE_KEYS.profile, JSON.stringify(profile));
+
+async function apiFetch(path, options) {
+  options = options || {};
+  const headers = Object.assign({}, options.headers || {});
+  if (API_KEY) headers['X-API-Key'] = API_KEY;
+  return fetch(apiUrl(path), Object.assign({}, options, { headers }));
 }
-function getMaterials() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.materials)) || []; } catch (e) { return []; }
+
+async function apiJson(path, options) {
+  options = options || {};
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
+  const resp = await apiFetch(path, Object.assign({}, options, { headers }));
+  return resp.json();
 }
-function saveMaterials(materials) {
-  localStorage.setItem(STORAGE_KEYS.materials, JSON.stringify(materials));
+
+async function loadState() {
+  try {
+    appState = await apiJson('/state');
+  } catch (e) {
+    appState = { profile: null, history: [] };
+  }
+  return appState;
 }
-function getHistory() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.history)) || []; } catch (e) { return []; }
+
+async function saveProfile(profile) {
+  appState.profile = profile;
+  await apiJson('/state/profile', { method: 'POST', body: JSON.stringify({ profile }) });
 }
-function saveHistory(history) {
-  localStorage.setItem(STORAGE_KEYS.history, JSON.stringify(history));
+
+async function saveHistory(history) {
+  appState.history = history;
+  await apiJson('/state/history', { method: 'POST', body: JSON.stringify({ history }) });
 }
+
+async function fetchMaterials() {
+  try {
+    const data = await apiJson('/materials');
+    return data.materials || [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function deleteMaterial(id) {
+  await apiFetch('/materials/' + id, { method: 'DELETE' });
+}
+
+let stateReady = loadState();
 
 // ── Screen navigation ────────────────────────────────────────────
 function showScreen(id) {
@@ -616,9 +692,9 @@ function showToast(text) {
 }
 
 // ── Splash ───────────────────────────────────────────────────────
-document.getElementById('btn-start').addEventListener('click', () => {
-  const profile = getProfile();
-  if (profile) {
+document.getElementById('btn-start').addEventListener('click', async () => {
+  await stateReady;
+  if (appState.profile) {
     showScreen('chat');
     renderHistory();
   } else {
@@ -635,7 +711,7 @@ function fillProfileForm(profile) {
   document.getElementById('p-courses').value = profile.courses || '';
 }
 
-document.getElementById('btn-save-profile').addEventListener('click', (e) => {
+document.getElementById('btn-save-profile').addEventListener('click', async (e) => {
   e.preventDefault();
   const form = document.getElementById('form-profile');
   if (!form.reportValidity()) return;
@@ -646,7 +722,7 @@ document.getElementById('btn-save-profile').addEventListener('click', (e) => {
     year: document.getElementById('p-year').value,
     courses: document.getElementById('p-courses').value.trim(),
   };
-  saveProfile(profile);
+  await saveProfile(profile);
   const wasEditingFromChat = document.getElementById('form-profile').dataset.editing === '1';
   document.getElementById('form-profile').dataset.editing = '';
   if (wasEditingFromChat) {
@@ -657,8 +733,9 @@ document.getElementById('btn-save-profile').addEventListener('click', (e) => {
   }
 });
 
-document.getElementById('btn-edit-profile').addEventListener('click', () => {
-  fillProfileForm(getProfile() || {});
+document.getElementById('btn-edit-profile').addEventListener('click', async () => {
+  await stateReady;
+  fillProfileForm(appState.profile || {});
   document.getElementById('form-profile').dataset.editing = '1';
   showScreen('profile');
 });
@@ -669,28 +746,26 @@ function fileIcon(filename) {
   return FILE_ICONS[ext] || '📎';
 }
 
-function renderFileList() {
-  const materials = getMaterials();
+async function renderFileList() {
+  const materials = await fetchMaterials();
   const list = document.getElementById('file-list');
   const emptyHint = document.getElementById('empty-hint');
   list.innerHTML = '';
   emptyHint.style.display = materials.length ? 'none' : 'block';
-  materials.forEach((m, idx) => {
+  materials.forEach((m) => {
     const li = document.createElement('li');
     li.className = 'file-item';
     const icon = m.type === 'error' ? '⚠️' : fileIcon(m.filename);
     li.innerHTML = `
       <span class="file-icon">${icon}</span>
       <span class="file-name">${escapeHtml(m.filename)}${m.type === 'error' ? ` <span class="file-error">— ${escapeHtml(m.error || 'שגיאה')}</span>` : ''}</span>
-      <button class="file-remove" data-idx="${idx}" title="הסר">✕</button>
+      <button class="file-remove" data-id="${m.id}" title="הסר">✕</button>
     `;
     list.appendChild(li);
   });
   list.querySelectorAll('.file-remove').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const materials = getMaterials();
-      materials.splice(parseInt(btn.dataset.idx, 10), 1);
-      saveMaterials(materials);
+    btn.addEventListener('click', async () => {
+      await deleteMaterial(btn.dataset.id);
       renderFileList();
     });
   });
@@ -702,48 +777,37 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
-function uploadFiles(fileList) {
+// מעלה קובץ-קובץ (לא בקשה אחת ענקית לכל התיקייה) — כך אין תקרת גודל מעשית
+// ורואים התקדמות אמיתית גם כשמעלים מאות קבצים בבת אחת.
+async function uploadFiles(fileList) {
   if (!fileList || !fileList.length) return;
-  const formData = new FormData();
-  for (const file of fileList) formData.append('files', file, file.name);
+  const files = Array.from(fileList);
 
   const progressWrap = document.getElementById('upload-progress');
   const progressFill = document.getElementById('progress-fill');
   const progressLabel = document.getElementById('progress-label');
   progressWrap.classList.add('active');
   progressFill.style.width = '0%';
-  progressLabel.textContent = `מעלה ${fileList.length} קבצים...`;
 
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', (window.API_URL || '') + '/upload');
-  xhr.upload.onprogress = (e) => {
-    if (e.lengthComputable) {
-      const pct = Math.round((e.loaded / e.total) * 100);
-      progressFill.style.width = pct + '%';
-      progressLabel.textContent = `מעלה... ${pct}%`;
-    }
-  };
-  xhr.onload = () => {
-    progressWrap.classList.remove('active');
+  let okCount = 0;
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    progressLabel.textContent = `מעלה ${i + 1} מתוך ${files.length}: ${file.name}`;
+    const formData = new FormData();
+    formData.append('files', file, file.name);
     try {
-      const data = JSON.parse(xhr.responseText);
-      if (data.error) {
-        showToast(data.error);
-        return;
-      }
-      const materials = getMaterials().concat(data.materials || []);
-      saveMaterials(materials);
-      renderFileList();
-      showToast('הקבצים עובדו בהצלחה');
+      const resp = await apiFetch('/upload', { method: 'POST', body: formData });
+      const data = await resp.json();
+      if (!data.error) okCount++;
     } catch (e) {
-      showToast('שגיאה בעיבוד הקבצים');
+      // ממשיכים לקובץ הבא גם אם אחד נכשל
     }
-  };
-  xhr.onerror = () => {
-    progressWrap.classList.remove('active');
-    showToast('שגיאת רשת בהעלאה');
-  };
-  xhr.send(formData);
+    progressFill.style.width = Math.round(((i + 1) / files.length) * 100) + '%';
+  }
+
+  progressWrap.classList.remove('active');
+  showToast(`הועלו ${okCount} מתוך ${files.length} קבצים`);
+  renderFileList();
 }
 
 document.getElementById('input-files').addEventListener('change', (e) => {
@@ -784,9 +848,10 @@ chatInput.addEventListener('keydown', (e) => {
 });
 btnSend.addEventListener('click', sendMessage);
 
-document.getElementById('btn-clear-chat').addEventListener('click', () => {
+document.getElementById('btn-clear-chat').addEventListener('click', async () => {
   if (!confirm('לנקות את כל השיחה?')) return;
-  saveHistory([]);
+  await apiFetch('/state/history', { method: 'DELETE' });
+  appState.history = [];
   chatMessages.innerHTML = '';
   showToast('השיחה נוקתה');
 });
@@ -851,9 +916,9 @@ function addMessageBubble(role, text, imagePreviewUrl) {
 
 function renderHistory() {
   chatMessages.innerHTML = '';
-  const history = getHistory();
+  const history = appState.history || [];
   if (!history.length) {
-    const profile = getProfile() || {};
+    const profile = appState.profile || {};
     addMessageBubble('assistant', `שלום ${profile.name || ''}! אני ד"ר א., העוזר האקדמי שלך. איך אפשר לעזור היום?`);
   } else {
     history.forEach((m) => addMessageBubble(m.role, typeof m.content === 'string' ? m.content : extractTextFromContent(m.content)));
@@ -886,7 +951,7 @@ async function sendMessage() {
   const imagePreview = pendingImage ? pendingImage.previewUrl : null;
   addMessageBubble('user', text, imagePreview);
 
-  const history = getHistory();
+  const history = appState.history || [];
   history.push({ role: 'user', content: text });
 
   chatInput.value = '';
@@ -894,21 +959,19 @@ async function sendMessage() {
   btnSend.disabled = true;
   showTyping();
 
-  const profile = getProfile() || {};
-  const materials = getMaterials();
+  const profile = appState.profile || {};
   const imageToSend = pendingImage;
   pendingImage = null;
   document.getElementById('image-preview-row').classList.remove('active');
 
   try {
-    const res = await fetch((window.API_URL || '') + '/chat', {
+    const res = await apiFetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         message: text,
         history: history.slice(0, -1),
         profile,
-        materials,
         image: imageToSend ? { media_type: imageToSend.media_type, data: imageToSend.data } : null,
       }),
     });
@@ -919,7 +982,7 @@ async function sendMessage() {
     } else {
       addMessageBubble('assistant', data.reply);
       history.push({ role: 'assistant', content: data.reply });
-      saveHistory(history);
+      await saveHistory(history);
     }
   } catch (e) {
     hideTyping();
@@ -931,7 +994,7 @@ async function sendMessage() {
 
 async function downloadAnswer(content, format) {
   try {
-    const res = await fetch((window.API_URL || '') + '/download/' + format, {
+    const res = await apiFetch('/download/' + format, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content, title: 'תשובת ד"ר א.' }),
@@ -952,6 +1015,95 @@ async function downloadAnswer(content, format) {
     URL.revokeObjectURL(url);
   } catch (e) {
     showToast('שגיאת רשת בהורדה');
+  }
+}
+
+// ── Voice input (הקלטה + תמלול, כמו תישי) ─────────────────────────
+const micBtn = document.getElementById('btn-mic');
+const recordingBar = document.getElementById('recording-bar');
+const recTimerEl = document.getElementById('rec-timer');
+const recStopBtn = document.getElementById('rec-stop');
+const recCancelBtn = document.getElementById('rec-cancel');
+
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordingTimerInterval = null;
+let recordingStart = 0;
+
+function formatTimer(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+async function startRecording() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.addEventListener('stop', () => stream.getTracks().forEach((t) => t.stop()));
+    mediaRecorder.start();
+    recordingStart = Date.now();
+    recordingBar.classList.add('active');
+    micBtn.classList.add('recording');
+    recTimerEl.textContent = '0:00';
+    recordingTimerInterval = setInterval(() => {
+      recTimerEl.textContent = formatTimer(Date.now() - recordingStart);
+    }, 250);
+  } catch (err) {
+    showToast('לא הצלחתי לגשת למיקרופון');
+  }
+}
+
+function stopRecording(shouldTranscribe) {
+  if (!mediaRecorder || mediaRecorder.state === 'inactive') return;
+  clearInterval(recordingTimerInterval);
+  recordingBar.classList.remove('active');
+  micBtn.classList.remove('recording');
+
+  mediaRecorder.addEventListener('stop', async () => {
+    if (shouldTranscribe && recordedChunks.length) {
+      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+      await transcribeAndInsert(blob, 'recording.webm');
+    }
+  }, { once: true });
+  mediaRecorder.stop();
+}
+
+micBtn.addEventListener('click', () => {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    stopRecording(true);
+  } else {
+    startRecording();
+  }
+});
+recStopBtn.addEventListener('click', () => stopRecording(true));
+recCancelBtn.addEventListener('click', () => stopRecording(false));
+
+async function transcribeAndInsert(blob, filename) {
+  const original = chatInput.placeholder;
+  chatInput.placeholder = 'מתמלל הקלטה...';
+  chatInput.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('file', blob, filename);
+    const resp = await apiFetch('/transcribe', { method: 'POST', body: form });
+    const data = await resp.json();
+    if (data.transcript) {
+      chatInput.value = (chatInput.value ? chatInput.value + ' ' : '') + data.transcript;
+      chatInput.style.height = 'auto';
+      chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
+    } else if (data.error) {
+      showToast(data.error);
+    }
+  } catch (err) {
+    showToast('שגיאת תמלול');
+  } finally {
+    chatInput.disabled = false;
+    chatInput.placeholder = original;
+    chatInput.focus();
   }
 }
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Dr. A Academic Assistant (port 5005)
+After=network.target
+
+[Service]
+User=malloy
+WorkingDirectory=/home/malloy/agents/dr-a
+EnvironmentFile=/home/malloy/agents/dr-a/.env
+ExecStart=/home/malloy/agents/dr-a/venv/bin/gunicorn app:app --bind 0.0.0.0:5005 --timeout 120
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

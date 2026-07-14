@@ -1,6 +1,7 @@
 flask
 flask-cors
 anthropic
+requests
 PyPDF2
 python-docx
 openpyxl

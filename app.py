@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
-import base64
 import io
 import os
+import re
+from functools import wraps
 
-import openpyxl
-import PyPDF2
 import anthropic
+import requests as http_requests
 from bidi.algorithm import get_display
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 from fpdf import FPDF
+
+import materials_store
+import state_store
+from extractors import ingest_file
 
 try:
     from dotenv import load_dotenv
@@ -24,12 +29,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
-app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB
+app.config['MAX_CONTENT_LENGTH'] = 30 * 1024 * 1024  # 30MB per request (single files; folders upload one file at a time)
 
 MODEL = 'claude-sonnet-5'
-
-IMAGE_EXT = {'png', 'jpg', 'jpeg'}
-TEXT_EXT = {'pdf', 'docx', 'xlsx', 'txt'}
+API_KEY = os.environ.get('DRA_API_KEY')
 
 SYSTEM_TEMPLATE = """אתה ד"ר א., עוזר אקדמי אישי. הסטודנט {name} לומד {degree} ב{institution}, שנה {year}. הקורסים שלו: {courses}. החומרים שהועלו: {materials}
 
@@ -46,54 +49,49 @@ def _load_api_key():
 client = anthropic.Anthropic(api_key=_load_api_key())
 
 
-# ─── Text extraction ────────────────────────────────────────────────────────
-
-def extract_pdf_text(stream):
-    reader = PyPDF2.PdfReader(stream)
-    parts = []
-    for page in reader.pages:
-        text = page.extract_text() or ''
-        if text.strip():
-            parts.append(text)
-    return '\n'.join(parts)
-
-
-def extract_docx_text(stream):
-    doc = Document(stream)
-    return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+def require_api_key(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return fn(*args, **kwargs)
+        if API_KEY and request.headers.get('X-API-Key') != API_KEY:
+            return jsonify({'error': 'unauthorized'}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
 
-def extract_xlsx_text(stream):
-    wb = openpyxl.load_workbook(stream, data_only=True)
-    lines = []
-    for sheet in wb.worksheets:
-        lines.append(f'== גיליון: {sheet.title} ==')
-        for row in sheet.iter_rows(values_only=True):
-            cells = [str(c) for c in row if c is not None]
-            if cells:
-                lines.append(' | '.join(cells))
-    return '\n'.join(lines)
+# ─── DOCX export (RTL, per-run bidi split) ───────────────────────────────────
+
+ENGLISH_RE = re.compile(r'[a-zA-Z0-9]+(?:[-_.][a-zA-Z0-9]+)*')
+HEBREW_RE = re.compile(r'[֐-׿]')
 
 
-def extract_txt_text(stream):
-    raw = stream.read()
-    for encoding in ('utf-8', 'cp1255', 'latin-1'):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
+def split_by_direction(text):
+    """Splits text into (direction, segment) runs so mixed Hebrew/English lines
+    render correctly in Word (ported from bidi_fixer/fix_bidi.py)."""
+    segments = []
+    last = 0
+    for m in ENGLISH_RE.finditer(text):
+        s, e = m.start(), m.end()
+        if s > last:
+            gap = text[last:s]
+            segments.append(('rtl' if HEBREW_RE.search(gap) else 'ltr', gap))
+        segments.append(('ltr', m.group()))
+        last = e
+    if last < len(text):
+        gap = text[last:]
+        segments.append(('rtl' if HEBREW_RE.search(gap) else 'ltr', gap))
+
+    merged = []
+    for direction, seg_text in segments:
+        if not seg_text:
             continue
-    return raw.decode('utf-8', errors='ignore')
+        if merged and merged[-1][0] == direction:
+            merged[-1] = (direction, merged[-1][1] + seg_text)
+        else:
+            merged.append((direction, seg_text))
+    return merged
 
-
-EXTRACTORS = {
-    'pdf': extract_pdf_text,
-    'docx': extract_docx_text,
-    'xlsx': extract_xlsx_text,
-    'txt': extract_txt_text,
-}
-
-
-# ─── DOCX export (RTL) ───────────────────────────────────────────────────────
 
 def set_rtl(paragraph):
     p_pr = paragraph._p.get_or_add_pPr()
@@ -105,6 +103,19 @@ def set_rtl(paragraph):
         r_pr.append(rtl)
 
 
+def ensure_paragraph_bidi(paragraph):
+    p_pr = paragraph._p.get_or_add_pPr()
+    p_pr.append(OxmlElement('w:bidi'))
+
+
+def set_run_rtl(run, is_rtl):
+    r_pr = run._element.get_or_add_rPr()
+    rtl_elem = OxmlElement('w:rtl')
+    if not is_rtl:
+        rtl_elem.set(qn('w:val'), '0')
+    r_pr.append(rtl_elem)
+
+
 def build_docx(text, title=None):
     doc = Document()
     if title:
@@ -112,9 +123,12 @@ def build_docx(text, title=None):
         heading.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         set_rtl(heading)
     for line in text.split('\n'):
-        paragraph = doc.add_paragraph(line)
+        paragraph = doc.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        set_rtl(paragraph)
+        ensure_paragraph_bidi(paragraph)
+        for direction, seg_text in split_by_direction(line):
+            run = paragraph.add_run(seg_text)
+            set_run_rtl(run, direction == 'rtl')
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -168,7 +182,9 @@ def build_pdf(text, title=None):
 
 @app.route('/')
 def index():
-    return send_from_directory(BASE_DIR, 'index.html')
+    with open(os.path.join(BASE_DIR, 'index.html'), encoding='utf-8') as f:
+        html = f.read()
+    return html.replace('__DRA_API_KEY__', API_KEY or '')
 
 
 @app.route('/config.js')
@@ -186,53 +202,105 @@ def service_worker():
     return send_from_directory(BASE_DIR, 'service-worker.js', mimetype='application/javascript')
 
 
-# ─── API: upload ──────────────────────────────────────────────────────────────
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        'status': 'ok',
+        'claude': bool(os.environ.get('ANTHROPIC_API_KEY')),
+        'transcribe': bool(os.environ.get('GROQ_API_KEY')),
+        'auth': bool(API_KEY),
+    })
+
+
+# ─── API: materials (server-side storage, shared with ingest_cli.py) ────────
 
 @app.route('/upload', methods=['POST'])
+@require_api_key
 def upload():
     files = request.files.getlist('files')
     if not files:
         return jsonify({'error': 'לא נבחרו קבצים'}), 400
 
-    materials = []
-    for f in files:
-        filename = f.filename or 'קובץ'
-        ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-
-        if ext in IMAGE_EXT:
-            try:
-                data = base64.b64encode(f.read()).decode('ascii')
-                media_type = 'image/jpeg' if ext in ('jpg', 'jpeg') else 'image/png'
-                materials.append({
-                    'filename': filename,
-                    'type': 'image',
-                    'media_type': media_type,
-                    'data': data,
-                })
-            except Exception as e:
-                materials.append({'filename': filename, 'type': 'error', 'error': str(e)})
-            continue
-
-        extractor = EXTRACTORS.get(ext)
-        if not extractor:
-            materials.append({
-                'filename': filename,
-                'type': 'error',
-                'error': 'סוג קובץ לא נתמך',
-            })
-            continue
-
-        try:
-            text = extractor(io.BytesIO(f.read()))
-            materials.append({
-                'filename': filename,
-                'type': 'text',
-                'content': text,
-            })
-        except Exception as e:
-            materials.append({'filename': filename, 'type': 'error', 'error': str(e)})
-
+    materials = [ingest_file(f.filename or 'קובץ', io.BytesIO(f.read())) for f in files]
     return jsonify({'materials': materials})
+
+
+@app.route('/materials', methods=['GET'])
+@require_api_key
+def get_materials():
+    return jsonify({'materials': materials_store.load_materials()})
+
+
+@app.route('/materials/<material_id>', methods=['DELETE'])
+@require_api_key
+def delete_material(material_id):
+    removed = materials_store.delete_material(material_id)
+    if not removed:
+        return jsonify({'error': 'החומר לא נמצא'}), 404
+    return jsonify({'ok': True})
+
+
+# ─── API: state (profile + history, shared across browsers/devices) ─────────
+
+@app.route('/state', methods=['GET'])
+@require_api_key
+def get_state():
+    return jsonify(state_store.load_state())
+
+
+@app.route('/state/profile', methods=['POST'])
+@require_api_key
+def post_profile():
+    data = request.json or {}
+    state_store.save_profile(data.get('profile') or {})
+    return jsonify({'ok': True})
+
+
+@app.route('/state/history', methods=['POST'])
+@require_api_key
+def post_history():
+    data = request.json or {}
+    state_store.save_history(data.get('history') or [])
+    return jsonify({'ok': True})
+
+
+@app.route('/state/history', methods=['DELETE'])
+@require_api_key
+def delete_history():
+    state_store.clear_history()
+    return jsonify({'ok': True})
+
+
+# ─── API: voice transcription (Groq Whisper, like tishi-server) ─────────────
+
+@app.route('/transcribe', methods=['POST'])
+@require_api_key
+def transcribe():
+    api_key = os.environ.get('GROQ_API_KEY')
+    if not api_key:
+        return jsonify({'error': 'GROQ_API_KEY לא מוגדר בשרת'}), 500
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'לא התקבל קובץ אודיו'}), 400
+
+    audio = request.files['file']
+    try:
+        resp = http_requests.post(
+            'https://api.groq.com/openai/v1/audio/transcriptions',
+            headers={'Authorization': f'Bearer {api_key}'},
+            files={'file': (audio.filename or 'audio.webm', audio.stream, audio.mimetype or 'audio/webm')},
+            data={'model': 'whisper-large-v3', 'language': 'he', 'response_format': 'json'},
+            timeout=120,
+        )
+        if resp.status_code != 200:
+            detail = resp.json().get('error', {}).get('message', resp.text[:200])
+            return jsonify({'error': f'שגיאת תמלול: {detail}'}), 502
+        text = resp.json().get('text', '').strip()
+        if not text:
+            return jsonify({'error': 'התמלול חזר ריק'}), 422
+        return jsonify({'transcript': text})
+    except Exception as e:
+        return jsonify({'error': f'שגיאת תמלול: {e}'}), 500
 
 
 # ─── API: chat ────────────────────────────────────────────────────────────────
@@ -278,13 +346,14 @@ def build_user_content(message_text, materials, inline_image):
 
 
 @app.route('/chat', methods=['POST'])
+@require_api_key
 def chat():
     data = request.json or {}
     message = data.get('message', '').strip()
     history = data.get('history', [])
     profile = data.get('profile') or {}
-    materials = data.get('materials') or []
     inline_image = data.get('image')
+    materials = materials_store.load_materials_with_data()
 
     if not message and not inline_image:
         return jsonify({'error': 'אין הודעה'}), 400
@@ -325,6 +394,7 @@ def chat():
 # ─── API: downloads ─────────────────────────────────────────────────────────
 
 @app.route('/download/docx', methods=['POST'])
+@require_api_key
 def download_docx():
     data = request.json or {}
     content = data.get('content', '')
@@ -339,6 +409,7 @@ def download_docx():
 
 
 @app.route('/download/pdf', methods=['POST'])
+@require_api_key
 def download_pdf():
     data = request.json or {}
     content = data.get('content', '')

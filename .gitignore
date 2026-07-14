@@ -9,3 +9,4 @@ test_*.json
 test_out.*
 test_input.*
 test_sample.txt
+data/
