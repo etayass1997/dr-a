@@ -50,12 +50,7 @@ python ingest_cli.py --folder "C:\path\to\course-materials"
    python3 -m venv venv
    venv/bin/pip install -r requirements.txt
    ```
-2. **קובץ `.env`** ב-`~/agents/dr-a/.env`:
-   ```
-   ANTHROPIC_API_KEY=sk-ant-...
-   GROQ_API_KEY=gsk_...
-   DRA_API_KEY=...
-   ```
+2. **משתני סביבה** — `ANTHROPIC_API_KEY`/`GROQ_API_KEY` המשותפים כבר יושבים ב-`~/agents/.env` (משותף לכל הסוכנים בשרת). אם רוצים `DRA_API_KEY` ייעודי לד"ר א' — מוסיפים אותו ב-`~/agents/dr-a/.env` (קובץ נפרד, אופציונלי, `dr-a.service` טוען את שניהם).
 3. **התקנת השירות** — ראו `dr-a.service` לדוגמת unit file:
    ```bash
    sudo cp dr-a.service /etc/systemd/system/dr-a.service
